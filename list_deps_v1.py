@@ -3,11 +3,16 @@
 
 Usage:
     python list_deps_v1.py <path_to_conanfile_dir> [--profile <profile>]
-    python list_deps_v1.py <path_to_conanfile_dir> --download <output_dir>
+    python list_deps_v1.py <path_to_conanfile_dir> --download <output_dir> --remote <remote>
 
-When --download is specified, each dependency's cache folder is archived
-into a .tgz file with a filesystem-safe name. A manifest.json maps each
-.tgz back to its original Conan reference for restoring on the target side.
+When --download is specified, each dependency is first fully fetched from
+the remote (recipe + sources + binaries) via `conan download`, then its
+cache folder is archived into a .tgz. This avoids the "exports_sources
+not found in local cache" error that occurs when packages were only
+installed (binaries only) rather than fully downloaded.
+
+A manifest.json maps each .tgz back to its original Conan reference for
+restoring on the target side.
 
 On the target machine, use the generated restore.sh:
     ./restore.sh                  # restore into local cache
@@ -114,7 +119,18 @@ def cache_path_for_ref(cache_dir, name, version, user, channel):
     return cache_dir / name / version / user / channel
 
 
-def download_deps(all_deps, output_dir):
+def fetch_from_remote(ref, remote):
+    """Fully download a package (recipe + sources + binaries) from a remote."""
+    cmd = ["conan", "download", ref, "-r", remote]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print("    WARNING: Failed to download {} from '{}':\n    {}".format(
+            ref, remote, result.stderr.strip()), file=sys.stderr)
+        return False
+    return True
+
+
+def download_deps(all_deps, output_dir, remote):
     """Archive each dependency's cache folder into a .tgz and write a manifest."""
     output_dir.mkdir(parents=True, exist_ok=True)
     cache_dir = get_conan_cache_dir()
@@ -123,6 +139,14 @@ def download_deps(all_deps, output_dir):
 
     for i, ref in enumerate(sorted(all_deps), 1):
         name, version, user, channel = all_deps[ref]
+
+        # Fetch full package from remote first (recipe + exports_sources + binaries)
+        if remote:
+            print("  [{}/{}] Downloading {} from '{}' ...".format(i, total, ref, remote))
+            if not fetch_from_remote(ref, remote):
+                print("    Skipping archive for {}".format(ref), file=sys.stderr)
+                continue
+
         pkg_path = cache_path_for_ref(cache_dir, name, version, user, channel)
 
         filename = ref_to_filename(ref)
@@ -188,6 +212,10 @@ def main():
     parser.add_argument("--profile", "-p", help="Conan profile to use", default=None)
     parser.add_argument("--download", "-d", metavar="OUTPUT_DIR",
                         help="Download all dependencies as .tgz files into this directory")
+    parser.add_argument("--remote", "-r",
+                        help="Conan remote to fully download packages from before archiving "
+                             "(fetches recipe + exports_sources + binaries). "
+                             "Required to avoid 'sources not found in local cache' errors.")
     args = parser.parse_args()
 
     conanfile_dir = Path(args.path).resolve()
@@ -219,7 +247,7 @@ def main():
         output_dir = Path(args.download).resolve()
         print("\nDownloading all dependencies to {} ...".format(output_dir))
         all_deps = {**direct, **transitive}
-        download_deps(all_deps, output_dir)
+        download_deps(all_deps, output_dir, args.remote)
 
 
 if __name__ == "__main__":
